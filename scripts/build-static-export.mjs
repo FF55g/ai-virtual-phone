@@ -25,6 +25,10 @@ const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const PARK_LIST = [
     path.join(projectRoot, "app", "api"),
     path.join(projectRoot, "app", "manifest.webmanifest"),
+    // 上游「现实桥/快捷指令」的动态 Route Handler（读请求体和服务端密钥），同样不能
+    // 进静态导出；离线 App 也用不到——iPhone 快捷指令走的是自部署站点，不是壳里这份包。
+    path.join(projectRoot, "app", "shortcut-run"),
+    path.join(projectRoot, "app", "personal-shortcut-run"),
 ];
 
 function run(cmd, args, env) {
