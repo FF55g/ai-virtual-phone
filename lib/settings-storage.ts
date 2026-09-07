@@ -15,6 +15,20 @@ import type {
 } from "./settings-types";
 import type { UserIdentity } from "@/components/settings/user-identity";
 import { createBuiltinPreset, BUILTIN_PRESET_VERSION } from "./builtin-preset";
+import {
+    NOVELAI_DEFAULT_MODEL,
+    NOVELAI_DEFAULT_NOISE_SCHEDULE,
+    NOVELAI_DEFAULT_RESOLUTION,
+    NOVELAI_DEFAULT_SAMPLER,
+    NOVELAI_DEFAULT_SCALE,
+    NOVELAI_DEFAULT_STEPS,
+    normalizeNovelAiModel,
+    normalizeNovelAiNoiseSchedule,
+    normalizeNovelAiResolution,
+    normalizeNovelAiSampler,
+    normalizeNovelAiScale,
+    normalizeNovelAiSteps,
+} from "./novelai-image-config";
 import { areTagsEqual, normalizePromptScopeTags, normalizeTags } from "./content-tag-utils";
 import {
     readPresetsCache, writePresetsCache,
@@ -25,6 +39,7 @@ import {
 } from "./settings-db";
 import { kvGet, kvSet, kvRemove, registerKvMigration } from "./kv-db";
 import { loadCharacters } from "./character-storage";
+import { isGenerationParameterKey } from "./generation-parameters";
 
 // --- Unsupported import format detection ---
 export const UNSUPPORTED_IMPORT_FORMAT = "UNSUPPORTED_IMPORT_FORMAT";
@@ -254,11 +269,15 @@ function normalizePresetPromptScope(prompt: Prompt): Prompt {
 export function savePresets(presets: PresetConfig[]): void {
     if (typeof window === "undefined") return;
     writePresetsCache(presets.map(stripDeprecatedPresetFields));
+    // 统一变更通知：预设管理器直接编辑保存此前不发事件，挂载中的聊天页（流式预览
+    // 标签配置等）拿不到新配置，最终清洗按新预设、预览按旧预设。监听方刷新是幂等的。
+    window.dispatchEvent(new CustomEvent("settings-presets-updated"));
 }
 
 export async function savePresetsAsync(presets: PresetConfig[]): Promise<void> {
     if (typeof window === "undefined") return;
     await writePresetsCacheAsync(presets.map(stripDeprecatedPresetFields));
+    window.dispatchEvent(new CustomEvent("settings-presets-updated"));
 }
 
 export async function ensureSettingsStorageHydrated(): Promise<void> {
@@ -306,6 +325,11 @@ export function parsePresetFromJson(text: string, fallbackName: string = "导入
         if (typeof obj.repetition_penalty === "number") preset.repetition_penalty = obj.repetition_penalty;
         if (typeof obj.openai_max_tokens === "number") preset.openai_max_tokens = obj.openai_max_tokens;
         if (typeof obj.openai_max_context === "number") preset.openai_max_context = obj.openai_max_context;
+        if (Array.isArray(obj.enabled_generation_parameters)) {
+            preset.enabled_generation_parameters = [
+                ...new Set((obj.enabled_generation_parameters as unknown[]).filter(isGenerationParameterKey)),
+            ];
+        }
         // New preset globals
         if (typeof obj.top_a === "number") preset.top_a = obj.top_a;
         if (typeof obj.min_p === "number") preset.min_p = obj.min_p;
@@ -324,6 +348,14 @@ export function parsePresetFromJson(text: string, fallbackName: string = "导入
         if (typeof obj.scenario_format === "string") preset.scenario_format = obj.scenario_format;
         if (typeof obj.personality_format === "string") preset.personality_format = obj.personality_format;
         if (typeof obj.story_summary_tag === "string") preset.story_summary_tag = obj.story_summary_tag;
+        // 思维链标签解析与剔除文本（导出走整对象展开，导入这里必须逐项接住，否则配置静默丢失）
+        if (typeof obj.thinking_tag === "string") preset.thinking_tag = obj.thinking_tag;
+        if (typeof obj.online_thinking_tag === "string") preset.online_thinking_tag = obj.online_thinking_tag;
+        if (typeof obj.online_thinking_enabled === "boolean") preset.online_thinking_enabled = obj.online_thinking_enabled;
+        if (typeof obj.offline_thinking_enabled === "boolean") preset.offline_thinking_enabled = obj.offline_thinking_enabled;
+        if (Array.isArray(obj.strip_texts)) {
+            preset.strip_texts = obj.strip_texts.filter((item: unknown): item is string => typeof item === "string");
+        }
 
         // Parse prompts if array
         if (Array.isArray(obj.prompts)) {
@@ -634,8 +666,25 @@ export function saveVoiceConfigs(configs: VoiceApiConfig[]): void {
 
 // --- Image Generation Settings ──────────────────────────────────────────
 
+export const DEFAULT_NOVELAI_PRESET: import("./settings-types").NovelAiPreset = {
+    id: "preset_default_anime",
+    name: "默认动漫预设",
+    model: NOVELAI_DEFAULT_MODEL,
+    resolution: NOVELAI_DEFAULT_RESOLUTION,
+    steps: NOVELAI_DEFAULT_STEPS,
+    scale: NOVELAI_DEFAULT_SCALE,
+    sampler: NOVELAI_DEFAULT_SAMPLER,
+    noiseSchedule: NOVELAI_DEFAULT_NOISE_SCHEDULE,
+    positivePrompt: "masterpiece, best quality, amazing quality, very aesthetic, absurdres",
+    negativePrompt: "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, artist name",
+    qualityToggle: true,
+    smea: false,
+    smeaDyn: false,
+};
+
 export const DEFAULT_IMAGE_GENERATION_SETTINGS: ImageGenerationSettings = {
     enabled: false,
+    provider: "openai",
     requestMode: "direct",
     apiKey: "",
     baseUrl: "https://api.openai.com/v1",
@@ -643,6 +692,11 @@ export const DEFAULT_IMAGE_GENERATION_SETTINGS: ImageGenerationSettings = {
     size: "1024x1024",
     quality: "auto",
     extraPrompt: "",
+    novelai: {
+        apiKey: "",
+        activePresetId: DEFAULT_NOVELAI_PRESET.id,
+        presets: [DEFAULT_NOVELAI_PRESET],
+    },
     characterReferences: {},
     imageHosting: {
         provider: "none",
@@ -654,32 +708,69 @@ export const DEFAULT_IMAGE_GENERATION_SETTINGS: ImageGenerationSettings = {
     },
 };
 
+function normalizeNovelAiPreset(preset: Partial<import("./settings-types").NovelAiPreset> | null | undefined, index: number): import("./settings-types").NovelAiPreset {
+    return {
+        id: typeof preset?.id === "string" && preset.id.trim() ? preset.id.trim() : `preset_nai_${Date.now()}_${index}`,
+        name: typeof preset?.name === "string" && preset.name.trim() ? preset.name.trim() : `预设 ${index + 1}`,
+        model: normalizeNovelAiModel(preset?.model),
+        resolution: normalizeNovelAiResolution(preset?.resolution),
+        steps: normalizeNovelAiSteps(preset?.steps),
+        scale: normalizeNovelAiScale(preset?.scale),
+        sampler: normalizeNovelAiSampler(preset?.sampler),
+        noiseSchedule: normalizeNovelAiNoiseSchedule(preset?.noiseSchedule),
+        positivePrompt: typeof preset?.positivePrompt === "string" ? preset.positivePrompt : DEFAULT_NOVELAI_PRESET.positivePrompt,
+        negativePrompt: typeof preset?.negativePrompt === "string" ? preset.negativePrompt : DEFAULT_NOVELAI_PRESET.negativePrompt,
+        qualityToggle: preset?.qualityToggle !== false,
+        smea: preset?.smea === true,
+        smeaDyn: preset?.smeaDyn === true,
+    };
+}
+
 function normalizeImageGenerationSettings(settings: Partial<ImageGenerationSettings> | null | undefined): ImageGenerationSettings {
     const refs = settings?.characterReferences && typeof settings.characterReferences === "object"
         ? settings.characterReferences
         : {};
+    const provider = settings?.provider === "novelai" ? "novelai" : "openai";
     const requestMode = settings?.requestMode === "server" || settings?.requestMode === "direct"
         ? settings.requestMode
         : DEFAULT_IMAGE_GENERATION_SETTINGS.requestMode;
     const hosting: Partial<ImageGenerationSettings["imageHosting"]> = settings?.imageHosting && typeof settings.imageHosting === "object"
         ? settings.imageHosting
         : {};
-    const provider = hosting.provider === "imgbb" ? "imgbb" : "none";
+    const hostingProvider = hosting.provider === "imgbb" ? "imgbb" : "none";
     const defaultExpirationSeconds = typeof hosting.defaultExpirationSeconds === "number"
         ? Math.max(0, Math.min(15552000, Math.floor(hosting.defaultExpirationSeconds)))
         : DEFAULT_IMAGE_GENERATION_SETTINGS.imageHosting.defaultExpirationSeconds;
     const maxUploadBytes = typeof hosting.maxUploadBytes === "number"
         ? Math.max(64 * 1024, Math.min(32 * 1024 * 1024, Math.floor(hosting.maxUploadBytes)))
         : DEFAULT_IMAGE_GENERATION_SETTINGS.imageHosting.maxUploadBytes;
+
+    const rawNai = settings?.novelai;
+    let naiPresets = Array.isArray(rawNai?.presets) && rawNai.presets.length > 0
+        ? rawNai.presets.map((p, idx) => normalizeNovelAiPreset(p, idx))
+        : [DEFAULT_NOVELAI_PRESET];
+    let activePresetId = typeof rawNai?.activePresetId === "string" ? rawNai.activePresetId : naiPresets[0].id;
+    if (!naiPresets.some(p => p.id === activePresetId)) {
+        activePresetId = naiPresets[0].id;
+    }
+
+    const novelai: import("./settings-types").NovelAiSettings = {
+        apiKey: typeof rawNai?.apiKey === "string" ? rawNai.apiKey : "",
+        activePresetId,
+        presets: naiPresets,
+    };
+
     return {
         ...DEFAULT_IMAGE_GENERATION_SETTINGS,
         ...(settings || {}),
+        provider,
         requestMode,
+        novelai,
         characterReferences: refs,
         imageHosting: {
             ...DEFAULT_IMAGE_GENERATION_SETTINGS.imageHosting,
             ...hosting,
-            provider,
+            provider: hostingProvider,
             defaultExpirationSeconds,
             maxUploadBytes,
             autoConvertToWebp: hosting.autoConvertToWebp !== false,
@@ -770,6 +861,38 @@ export function saveBindingConfig(config: BindingConfig, notify: boolean = true)
     if (typeof window === "undefined") return;
     kvSet(BINDINGS_KEY, JSON.stringify(config));
     if (notify) window.dispatchEvent(new CustomEvent("settings-bindings-updated"));
+}
+
+/**
+ * 全局默认绑定「所见即所得」：API 配置 / 预设 / 用户身份三项不再有"未设置"态。
+ * 未设置（或指向已删除对象）时，把实际兜底值写进存储——API=第一个配置、
+ * 预设=内置预设、身份=列表第一条——让绑定界面显示的就是实际生效的，
+ * 消灭"没绑却悄悄用了第一个"的静默兜底（多身份用户曾因此身份错乱进记忆）。
+ * 列表为空的项保持缺省。应用启动和绑定界面加载时各跑一次即可，不在热路径调用。
+ */
+export function ensureGlobalBindingDefaults(): void {
+    if (typeof window === "undefined") return;
+    const config = loadBindingConfig();
+    const global = config.globalDefaults;
+    let changed = false;
+
+    const apiConfigs = loadApiConfigs();
+    if (apiConfigs.length > 0 && !apiConfigs.some(c => c.id === global.apiConfigId)) {
+        global.apiConfigId = apiConfigs[0].id;
+        changed = true;
+    }
+    const presets = loadPresets();
+    if (presets.length > 0 && !presets.some(p => p.id === global.presetId)) {
+        global.presetId = (presets.find(p => p.builtIn) ?? presets[0]).id;
+        changed = true;
+    }
+    const identities = loadUserIdentities();
+    if (identities.length > 0 && !identities.some(i => i.id === global.userIdentityId)) {
+        global.userIdentityId = identities[0].id;
+        changed = true;
+    }
+
+    if (changed) saveBindingConfig(config);
 }
 
 /**

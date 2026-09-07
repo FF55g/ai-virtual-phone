@@ -5,10 +5,11 @@
 // 各挑一件调成「特调」，特调可命名保存/分享。对局 = 角色卡 + 特调的一次运行。
 // 本文件只定义数据形状，装配见 assembler.ts，存取见 storage.ts。
 
-/** 材料十类（槽位一一对应） */
+/** 材料种类（槽位一一对应） */
 export type MixMaterialKind =
     | "character" // 角色卡
     | "persona"   // 面具：用户人设（{{user}} 的名字与设定）
+    | "preface"   // 序言：提示词最顶上的开场说明（择一；不配则没有这一段）
     | "base"      // 基底：扮演总纲
     | "flavor"    // 风味：文风
     | "glass"     // 杯型：输出格式
@@ -16,12 +17,14 @@ export type MixMaterialKind =
     | "ticket"    // 小票：状态数据卡（输出契约 + 渲染代码）
     | "garnish"   // 外观：界面美化 CSS
     | "encore"    // 尾调：随卡互动 HTML 小品
+    | "checklist" // 核对：输出格式检查——系统提示词最后一节的收尾清单（叠加；不配则没有这一段，官方出厂件可选）
     | "filter"    // 滤网：正则清洗正文（不进提示词）
     | "mechanism"; // 机括：沙盒里跑的钩子逻辑 + 常驻界面
 
 export const MIX_KIND_LABELS: Record<MixMaterialKind, string> = {
     character: "角色卡",
     persona: "面具",
+    preface: "序言",
     base: "基底",
     flavor: "风味",
     glass: "杯型",
@@ -29,19 +32,21 @@ export const MIX_KIND_LABELS: Record<MixMaterialKind, string> = {
     ticket: "小票",
     garnish: "外观",
     encore: "尾调",
+    checklist: "核对",
     filter: "滤网",
     mechanism: "机括",
 };
 
 /** 吧台槽位顺序（角色卡永远第一槽） */
 export const MIX_SLOT_ORDER: MixMaterialKind[] = [
-    "character", "persona", "base", "flavor", "glass", "strength", "ticket", "garnish", "encore", "filter", "mechanism",
+    "character", "persona", "preface", "base", "flavor", "glass", "strength", "ticket", "garnish", "encore", "checklist", "filter", "mechanism",
 ];
 
 /** TAB 上大字下面那行小字：说明这一类到底干什么（不进提示词的种类标它的实际职责） */
 export const MIX_KIND_SECTION_LABELS: Record<MixMaterialKind, string> = {
     character: "角色资料",
     persona: "用户资料",
+    preface: "开场说明",
     base: "扮演总纲",
     flavor: "文风",
     glass: "正文输出要求",
@@ -49,6 +54,7 @@ export const MIX_KIND_SECTION_LABELS: Record<MixMaterialKind, string> = {
     ticket: "状态栏",
     garnish: "界面样式",
     encore: "小剧场",
+    checklist: "输出格式检查",
     filter: "正则替换",
     mechanism: "可执行逻辑",
 };
@@ -56,30 +62,30 @@ export const MIX_KIND_SECTION_LABELS: Record<MixMaterialKind, string> = {
 /** 必选槽：没配齐不能开局；其余槽可留空 */
 export const MIX_REQUIRED_KINDS: MixMaterialKind[] = ["character"];
 
-/** 一格最多叠几件 */
-export const MIX_SLOT_MAX = 3;
-
 /**
  * 叠放语义：
- * concat = 这一格里条件满足的全部生效，按顺序依次拼接（多段文风叠加、主装饰 + 补丁装饰）；
- * first  = 只用第一件条件满足的（状态卡只能有一张、小剧场一轮只演一出）。
+ * concat = 这一格里条件满足的全部生效，按顺序依次拼接（多段文风叠加、主装饰 + 补丁装饰；
+ *          小票/尾调是"多块并行"——每件各自成块，一轮可同时带多个状态栏与小剧场）；
+ * first  = 只用第一件条件满足的（一局只有一张角色卡、一副面具）。
  */
 export const MIX_SLOT_STACK: Record<MixMaterialKind, "concat" | "first"> = {
     character: "first",
     persona: "first",
+    preface: "first",
     base: "concat",
     flavor: "concat",
     glass: "concat",
     strength: "concat",
-    ticket: "first",
+    ticket: "concat",
     garnish: "concat",
-    encore: "first",
+    encore: "concat",
+    checklist: "concat",
     filter: "concat",
     mechanism: "concat",
 };
 
-/** 不给设生效条件的格：这两格没了这一局就不成立 */
-export const MIX_NO_CONDITION_KINDS: MixMaterialKind[] = ["character", "persona"];
+/** 不给设生效条件的格：择一型的格不吃条件（角色卡/面具没了这一局就不成立，序言恒在顶端） */
+export const MIX_NO_CONDITION_KINDS: MixMaterialKind[] = ["character", "persona", "preface"];
 
 /**
  * 会在下载方设备上「按轮执行、且能改写对话」的材料。
@@ -192,14 +198,59 @@ export type MixCharacterCard = MixMaterialMeta & {
     examples?: { role: "user" | "char"; text: string }[];
     /** 附加设定：NPC、私设名词表等自由区 */
     extra?: string;
+    /**
+     * 资料的编辑模式。缺省/"form" = 分框表单：上面九个字段各占一框；
+     * "freeform" = 一框式：角色资料、世界与剧情各一个大框，正文（含作者自己写的 ## 小节）
+     * 原样进提示词，此时上面九个字段一律为空，profileText / worldText 才是正文。
+     * 角色名不在框里：仍由 charName 提供，装配时自动补 ## 角色名。
+     */
+    profileMode?: MixCardProfileMode;
+    /** 一框式的「角色资料」正文（仅 profileMode 为 "freeform" 时有意义） */
+    profileText?: string;
+    /** 一框式的「世界与剧情」正文（仅 profileMode 为 "freeform" 时有意义） */
+    worldText?: string;
     /** @deprecated 已被开场画布取代，仅为兼容旧数据保留 */
     authorNote?: string;
 };
 
-/** 纯文本类材料：基底 / 风味 / 杯型 / 苦精 */
+/** 角色卡资料的编辑模式：分框表单 / 一框式 */
+export type MixCardProfileMode = "form" | "freeform";
+
+/** 可由序言材料覆写标题的提示词分段 */
+export type MixSectionTitleKey =
+    | "base"      // 扮演总纲
+    | "character" // 角色资料
+    | "persona"   // 用户资料
+    | "world"     // 世界与剧情
+    | "flavor"    // 文风
+    | "glass"     // 正文输出要求
+    | "ticket"    // 状态栏
+    | "encore"    // 小剧场
+    | "examples"  // 示例对话
+    | "checklist"; // 输出格式检查
+
+/** 各分段的默认标题（编辑器占位符与装配器共用，逐字即历史版本的标题） */
+export const MIX_SECTION_TITLE_DEFAULTS: Record<MixSectionTitleKey, string> = {
+    base: "扮演总纲",
+    character: "角色资料",
+    persona: "用户资料",
+    world: "世界与剧情",
+    flavor: "文风",
+    glass: "正文输出要求",
+    ticket: "状态栏",
+    encore: "小剧场",
+    examples: "示例对话",
+    checklist: "输出格式检查",
+};
+
+/** 纯文本类材料：序言 / 基底 / 风味 / 杯型 / 苦精 */
 export type MixTextMaterial = MixMaterialMeta & {
-    kind: "base" | "flavor" | "glass" | "strength";
+    kind: "preface" | "base" | "flavor" | "glass" | "strength" | "checklist";
     content: string;
+    /** 仅序言使用：自定义各分段标题（可用 {{char}}/{{user}} 宏），让整份提示词
+     *  的措辞跟上序言定下的基调。缺省/留空的键用默认标题；交叉引用（如输出
+     *  格式检查里提到的段名）会跟着换。 */
+    sectionTitles?: Partial<Record<MixSectionTitleKey, string>>;
 };
 
 /** 面具（用户人设）：{{user}} 是谁——名字 + 人设正文，装配成「用户资料」段 */
@@ -232,6 +283,13 @@ export type MixTicketMaterial = MixMaterialMeta & {
     previewRaw?: string;
     /** 这张小票里哪几项要记住（记住的值可被条件判断、可被 {{状态.X}} 取用） */
     vars?: MixTicketVar[];
+    /**
+     * 历史回传策略：往期轮次的壳内原文要不要回传给模型。
+     * latest（默认）= 只回传最近一轮——状态接续与格式示范都够用，token 不随轮数涨；
+     * all = 全部回传——契约需要引用往期内容时用，token 随轮数线性增长；
+     * none = 完全不回传——纯展示、不需要接续也不怕掉格式时最省 token。
+     */
+    historyFeed?: "latest" | "all" | "none";
 };
 
 /** 外观：对局界面美化（官方语义类 + 界面定位符的 CSS） */
@@ -251,6 +309,8 @@ export type MixEncoreMaterial = MixMaterialMeta & {
     html?: string;
     /** 编辑器预览用示例数据 */
     previewRaw?: string;
+    /** 历史回传策略（同小票）：latest（默认）只回传最近一轮，all 全部回传，none 完全不回传 */
+    historyFeed?: "latest" | "all" | "none";
 };
 
 /** 尾调渲染代码：新旧字段统一出口 */
@@ -327,6 +387,33 @@ export type MixPanelLayout = {
     z?: number;
     /** 开局时收起（只有 chrome 为 bar 时才有收起这回事） */
     collapsed?: boolean;
+    /** 挂点（见 MIX_PANEL_SLOTS）；不写 = float 自由悬浮，老材料全部落在这档 */
+    slot?: MixPanelSlot;
+    /** 按钮位（header/inputbar-*）的图标：一两个 emoji 或单字，宿主画在按钮上 */
+    icon?: string;
+};
+
+/**
+ * 机括挂点：面板长在对局画面的哪儿。
+ * float（默认）= 自由悬浮层，位置尺寸全由摆放/mix API 说了算；
+ * header / inputbar-left / inputbar-right = 宿主在标题栏或输入栏画一颗图标按钮，
+ *   点击开合面板（按钮由宿主渲染，样式统一、位置精确，沙盒碰不到宿主排版）；
+ * flow-top / flow-bottom = 面板作为一张内嵌卡直接进滚动流（画布之下 / 轮次流末尾），
+ *   随内容滚动，autoHeight 常开，不可拖不可缩；
+ * hidden = 不画任何东西，界面代码在看不见的沙盒里后台跑——只靠对白按钮 / 钩子驱动、
+ *   用 mix.play / mix.toast 与玩家交互的机括（比如「朗读」）用它。
+ */
+export const MIX_PANEL_SLOTS = ["float", "header", "inputbar-left", "inputbar-right", "flow-top", "flow-bottom", "hidden"] as const;
+export type MixPanelSlot = (typeof MIX_PANEL_SLOTS)[number];
+
+export const MIX_PANEL_SLOT_LABELS: Record<MixPanelSlot, string> = {
+    float: "自由悬浮",
+    header: "标题栏按钮",
+    "inputbar-left": "输入栏左侧按钮",
+    "inputbar-right": "输入栏右侧按钮",
+    "flow-top": "正文顶部",
+    "flow-bottom": "正文尾部",
+    hidden: "无界面（后台运行）",
 };
 
 /** 拖丢了捡不回来，所以无论怎么拖都至少留这么多在画面里（百分比） */
@@ -337,7 +424,7 @@ export const MIX_PANEL_MIN_H = 4;
 /** 层级上限：再高会压到应用自己的弹窗上面去 */
 export const MIX_PANEL_MAX_Z = 9;
 
-/** 四个老停靠位对应的摆放，同时也是编辑器里的起手式 */
+/** 四个老停靠位对应的摆放：只用来把老材料换算过来，编辑器里不再提供选择 */
 export const MIX_DOCK_PRESETS: Record<MixDock, MixPanelLayout> = {
     left: { x: 2, y: 12, w: 38, h: 52, drag: true, chrome: "bar", plate: true },
     right: { x: 60, y: 12, w: 38, h: 52, drag: true, chrome: "bar", plate: true },
@@ -374,7 +461,16 @@ export function normalizeMixPanelLayout(value: unknown): MixPanelLayout | undefi
     const z = clampNum(record.z, 0, MIX_PANEL_MAX_Z, 0);
     if (z) layout.z = z;
     if (record.collapsed === true) layout.collapsed = true;
+    if (typeof record.slot === "string" && record.slot !== "float" && (MIX_PANEL_SLOTS as readonly string[]).includes(record.slot)) {
+        layout.slot = record.slot as MixPanelSlot;
+    }
+    if (typeof record.icon === "string" && record.icon.trim()) layout.icon = record.icon.trim().slice(0, 4);
     return layout;
+}
+
+/** 一份摆放实际落在哪个挂点 */
+export function mixPanelSlotOf(layout: MixPanelLayout | undefined): MixPanelSlot {
+    return layout?.slot ?? "float";
 }
 
 /**
@@ -400,6 +496,10 @@ export function mixPanelLayoutOf(material: { layout?: MixPanelLayout; dock?: Mix
 
 /** 详情页上用一行字说清这份摆放 */
 export function mixPanelLayoutSummary(layout: MixPanelLayout): string {
+    const slot = mixPanelSlotOf(layout);
+    if (slot !== "float") {
+        return `${MIX_PANEL_SLOT_LABELS[slot]}${layout.icon ? ` · 图标 ${layout.icon}` : ""}`;
+    }
     const parts = [
         `左 ${layout.x}% · 上 ${layout.y}%`,
         `${layout.w}% × ${layout.autoHeight ? "随内容" : `${layout.h}%`}`,
@@ -415,7 +515,7 @@ export function mixPanelLayoutSummary(layout: MixPanelLayout): string {
 }
 
 /**
- * 自由摆放换算回最接近的老停靠位。发布时一起写上去，
+ * 自由摆放换算回最接近的老停靠位。老材料改存时一起写上去，
  * 老版本客户端拿到这件机括时还能把它挂在个大致对的地方，而不是直接不显示。
  */
 export function mixNearestDock(layout: MixPanelLayout): MixDock {
@@ -437,10 +537,94 @@ export type MixMechanismMaterial = MixMaterialMeta & {
     script?: string;
     /** @deprecated 第一版的四个停靠位，只为认得出老材料而保留；新材料写 layout */
     dock?: MixDock;
-    /** 常驻界面画在哪、多大、能不能拖；不填也没有 dock 则这件机括没有界面 */
+    /**
+     * 常驻界面的起始摆放。新材料一般没有这个字段——画在哪、多大、要不要应用画外壳，
+     * 都在界面代码里用 mix.move / mix.size / mix.chrome … 写。有没有界面看 panelHtml。
+     */
     layout?: MixPanelLayout;
     /** 常驻界面的 HTML（含 CSS/JS），在沙盒 iframe 里跑 */
     panelHtml?: string;
+    /**
+     * 界面要用的连接器名字（如 ["tts"]）。连接器是玩家自己在酒柜里配的外部接口
+     * （地址与密钥只留在本机），界面通过 mix.call(名字, 参数) 请宿主代调。
+     * 只有在这里声明过的名字才调得动——材料拿不到没声明的接口，玩家也一眼知道它要什么。
+     */
+    connectors?: string[];
+    /**
+     * 对白按钮：装了这件机括的对局里，宿主在每句「对白」后面画一颗小图标，
+     * 点击把这句话递进常驻界面（window.onMixDialogue）。按钮由宿主画、样式统一，
+     * 界面只管收到之后做什么（比如请连接器合成语音）。需要有 panelHtml 才收得到。
+     */
+    dialogueButton?: MixDialogueButton;
+    /**
+     * 信任模式：script 直接在对局页面里执行（不进沙盒），像聊天插件一样拿到裸 DOM——
+     * 每轮正文、每轮下方、悬浮层都可以随意画，也能自己 fetch。代价是它看得到整台小手机的
+     * 数据。装入配方 / 入柜 / 导入时都会向玩家明示。panelHtml 在此模式下不用，界面由代码画。
+     */
+    trusted?: boolean;
+};
+
+export type MixDialogueButton = {
+    /** 画在按钮上的一两个 emoji 或单字 */
+    icon: string;
+    /** 长按/悬停提示，选填 */
+    title?: string;
+};
+
+/** 对白按钮的状态（界面用 mix.mark 回报）：busy 转圈、playing 高亮、空串恢复 */
+export type MixDialogueState = "busy" | "playing" | "";
+
+export function normalizeMixDialogueButton(value: unknown): MixDialogueButton | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const record = value as Record<string, unknown>;
+    const icon = typeof record.icon === "string" ? record.icon.trim().slice(0, 4) : "";
+    if (!icon) return undefined;
+    const title = typeof record.title === "string" ? record.title.trim().slice(0, 24) : "";
+    return title ? { icon, title } : { icon };
+}
+
+/** 连接器名字：机括按它找连接器。只收短的标识符，免得大小写/空格对不上 */
+export const MIX_CONNECTOR_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+export const MIX_CONNECTOR_MAX = 20;
+
+/** 规整一份连接器名单：去空、去重、只留合法名字 */
+export function normalizeMixConnectorNames(value: unknown): string[] {
+    const raw = Array.isArray(value) ? value : typeof value === "string" ? value.split(/[,，、\s]+/) : [];
+    const out: string[] = [];
+    for (const item of raw) {
+        const name = String(item ?? "").trim().toLowerCase();
+        if (!MIX_CONNECTOR_NAME_RE.test(name) || out.includes(name)) continue;
+        out.push(name);
+        if (out.length >= MIX_CONNECTOR_MAX) break;
+    }
+    return out;
+}
+
+/** 连接器的响应怎么交给机括：json 解析成对象；text 原样字符串；blob 转成 data: URL（音频/图片） */
+export type MixConnectorResponse = "json" | "text" | "blob";
+
+/**
+ * 连接器：玩家自己配的一个外部接口。地址、请求头（密钥在这里）、请求体模板都是玩家的，
+ * 材料只知道名字。mix.call 传来的参数替换模板里的 {{参数名}}（可写默认值 {{参数名|默认}}），
+ * 宿主代为发请求，把响应交回沙盒。不随材料导出、不上大厅，永远只留在本机。
+ */
+export type MixConnector = {
+    id: string;
+    /** 机括按这个名字找它，满足 MIX_CONNECTOR_NAME_RE */
+    name: string;
+    /** 给自己看的说明（选填） */
+    note?: string;
+    url: string;
+    method: "POST" | "GET";
+    /** 请求头；值里同样可用 {{参数名}} */
+    headers: Record<string, string>;
+    /** 请求体模板；GET 忽略。模板本身是 JSON 时，替换进去的字符串会自动转义 */
+    body: string;
+    response: MixConnectorResponse;
+    /** 由哪个预设生成（仅展示用） */
+    preset?: string;
+    createdAt: number;
+    updatedAt: number;
 };
 
 export type MixMaterial =
@@ -501,7 +685,7 @@ export function mixSlotFirstId(slots: MixSlotsRaw | undefined, kind: MixMaterial
 export function normalizeMixSlots(slots: MixSlotsRaw | undefined): Partial<Record<MixMaterialKind, MixSlotEntry[]>> {
     const out: Partial<Record<MixMaterialKind, MixSlotEntry[]>> = {};
     for (const kind of MIX_SLOT_ORDER) {
-        const entries = mixSlotEntries(slots, kind).slice(0, MIX_SLOT_MAX);
+        const entries = mixSlotEntries(slots, kind);
         if (entries.length) out[kind] = entries;
     }
     return out;
@@ -511,7 +695,7 @@ export function normalizeMixSlots(slots: MixSlotsRaw | undefined): Partial<Recor
 export type MixRecipe = {
     id: string;
     name: string;
-    /** kind → 这一格叠的材料（有序，最多 MIX_SLOT_MAX 件）；角色卡必有，其余可缺 */
+    /** kind → 这一格叠的材料（有序，不设数量上限）；角色卡必有，其余可缺 */
     slots: Partial<Record<MixMaterialKind, MixSlotEntry[]>>;
     /** 作者署名与头像：从配方页入柜时带回；自己的配方展示本地创作者资料 */
     author?: string;
@@ -526,21 +710,69 @@ export type MixRecipe = {
     updatedAt: number;
 };
 
+/**
+ * 一轮里的一块壳内原文（状态栏或小剧场）。
+ * id = 供稿材料：渲染时按它找皮（现役件 → 退役快照 → 酒柜同 id 件）；
+ * 抽不到归属（旧格式输出、契约外的多余块）时缺省，渲染退回这一格的第一件。
+ */
+export type MixTurnBlock = {
+    id?: string;
+    raw: string;
+};
+
 /** 对局消息 */
 export type MixTurn = {
     id: string;
     role: "user" | "assistant";
     /** 正文（assistant 侧已剥离小票块） */
     text: string;
-    /** 该轮小票壳内原文（有小票材料且 AI 按契约输出时才有） */
+    /**
+     * 这一轮的原始输出（assistant 侧）：进剥离/滤网/机括之前的完整原文，
+     * 含机括标记行与被滤网洗掉的字。
+     * 「编辑原始输出」展示并回写的就是这一份；老数据没有这个字段，
+     * 编辑时退回用产物拼装（mixTurnRawText 的兜底路径）。
+     */
+    rawText?: string;
+    /** 该轮小票壳内原文（有小票材料且 AI 按契约输出时才有）；多块时为第一块，全量见 ticketRaws */
     ticketRaw?: string;
-    /** 该轮小剧场壳内原文（尾调写了契约且 AI 输出时才有） */
+    /** 该轮小剧场壳内原文（尾调写了契约且 AI 输出时才有）；多块时为第一块，全量见 encoreRaws */
     encoreRaw?: string;
+    /**
+     * 多块并行（一轮多个状态栏/小剧场）时的全量块序列，按输出顺序排列。
+     * 老数据没有这两个字段——读取一律走 mixTurnTicketBlocks / mixTurnEncoreBlocks，
+     * 它们会把旧的单块字段包装成一块返回。
+     */
+    ticketRaws?: MixTurnBlock[];
+    encoreRaws?: MixTurnBlock[];
+    /**
+     * 供稿材料戳（可选）：平时不写——历史轮跟着当前件的渲染代码走（整体换皮）。
+     * 只在局中换小票/尾调那一刻，由旧件给已有的轮盖上自己的 id；
+     * 渲染时有戳的轮用戳指向的皮（见 MixSession.retiredRender），新轮用新件。
+     * 多块格式的轮不用戳——每块自带供稿材料 id。
+     */
+    ticketId?: string;
+    encoreId?: string;
     /**
      * 这一轮结束时记住的值。回溯 / 重说 / 编辑某轮之后，
      * 直接取剩下最后一轮的这份快照还原，数字不会停留在被丢掉的未来。
      */
     state?: MixState;
+    /**
+     * 这一轮结束时的机括存储（与 state 同一套语义，只在 assistant 轮上）。
+     * 有它才谈得上"干净回溯"：机括存储是任意可读写的，不像 turns 那样只增不改，
+     * 砍掉几轮推不出过去的样子，只能当时拍照留档。
+     *
+     * 只留最近 MIX_STORE_SNAPSHOT_TURNS 轮（见 engine.ts）——存储桶单件上限 100KB，
+     * 逐轮全留会把对局存档撑爆。窗口外的回溯退到现存最早的那份；老对局没有这个
+     * 字段，回溯时维持现状，绝不清空。
+     */
+    mechanismStore?: Record<string, Record<string, string>>;
+    /**
+     * 玩家在机括面板里手改过的桶（materialId → 桶），记在手改发生的那一轮上。
+     * 编辑早先某一轮后要把后面每一轮按原文重画一遍，重画走到这一轮时会拿它再盖一次：
+     * 手改是玩家亲手定的事实，永远压过重画算出来的结果。
+     */
+    mechanismStoreEdits?: Record<string, Record<string, string>>;
     createdAt: number;
 };
 
@@ -566,13 +798,61 @@ export type MixSession = {
      */
     mechanismStore?: Record<string, Record<string, string>>;
     /**
+     * 最后一轮出杯后钩子跑之前的机括存储快照 + 它属于哪一轮。
+     * 编辑原始输出后的「替换重跑」靠它：先回到这轮记账前的底稿再重跑一次钩子，
+     * 原来那笔账自然作废，反复编辑反复同步也只记一笔。只留最后一轮——
+     * 编辑角色回复本来就会把之后的轮全部截掉，编辑完它一定是最后一轮。
+     */
+    mechanismStorePrev?: Record<string, Record<string, string>>;
+    mechanismStorePrevTurn?: string;
+    /**
      * 玩家自己拖动/缩放过的面板位置（materialId → 摆放），只在这一局有效。
      * 不写回材料：材料是作者的作品，玩家挪一下自己的屏幕不该改到别人的作品。
      */
     panelBox?: Record<string, MixPanelLayout>;
+    /**
+     * 按钮位机括面板的开合状态（materialId → 是否展开），按局记忆。
+     * 只对挂在 header/inputbar-* 的机括有意义；关掉的面板不渲染（重开会重载，
+     * 需要留住的状态放机括存储桶里）。
+     */
+    panelOpen?: Record<string, boolean>;
+    /**
+     * 退役的渲染皮（materialId → 渲染 HTML）：局中换小票/尾调那一刻，旧件的
+     * 渲染代码快照进来，被盖了戳的历史轮（MixTurn.ticketId/encoreId）按这份
+     * 皮回放——旧件之后从酒柜删掉也不受影响。每件只存一份，不逐轮存。
+     */
+    retiredRender?: Record<string, string>;
+    /**
+     * 回传上下文轮数上限（一轮 = 一次 AI 回复）。不设 = 全部历史回传；
+     * 设了只把最近 N 轮发给模型——只影响请求内容，存储与界面回放永远完整。
+     */
+    historyLimit?: number;
+    /**
+     * 背景观感微调（对局页右上角亮度按钮）：mask = 蒙版亮度 -40~100（0 为默认
+     * 三段蒙版原样，负值在蒙版外再压一层匀黑更暗，100 为完全无蒙版）；
+     * blur = 封面模糊 0~20px。按局保存——不同封面的明暗各不相同，各局各调。
+     */
+    bgTune?: { mask: number; blur: number };
     createdAt: number;
     updatedAt: number;
 };
+
+/**
+ * 读一轮的状态栏块序列：新格式（ticketRaws）直接用；老数据把单块字段包装成一块，
+ * 块的归属沿用换装时盖的戳（没盖过就是缺省 = 跟当前件走）。
+ */
+export function mixTurnTicketBlocks(turn: MixTurn): MixTurnBlock[] {
+    if (turn.ticketRaws?.length) return turn.ticketRaws;
+    if (turn.ticketRaw) return [{ id: turn.ticketId, raw: turn.ticketRaw }];
+    return [];
+}
+
+/** 读一轮的小剧场块序列（同 mixTurnTicketBlocks） */
+export function mixTurnEncoreBlocks(turn: MixTurn): MixTurnBlock[] {
+    if (turn.encoreRaws?.length) return turn.encoreRaws;
+    if (turn.encoreRaw) return [{ id: turn.encoreId, raw: turn.encoreRaw }];
+    return [];
+}
 
 /**
  * 与云端的关联状态（参考应用市场的显式同步模型）：

@@ -1608,6 +1608,38 @@
   animation: chat-generated-image-spin 0.8s linear infinite;
 }
 
+/* 重新生成中的角标：状态落库在消息上（pending），滚走再回来角标还在 */
+.chat-generated-image-regen-wrap {
+  position: relative;
+}
+
+.chat-generated-image-regen-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: calc(10.8px*var(--app-text-scale,1));
+  line-height: 1;
+  pointer-events: none;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.chat-generated-image-regen-spinner {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  border: 1.5px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #fff;
+  animation: chat-generated-image-spin 0.8s linear infinite;
+}
+
 .chat-generated-image-retry-error,
 .feed-post-photo-retry-error {
   max-width: 240px;
@@ -1615,24 +1647,6 @@
   font-size: calc(11px*var(--app-text-scale,1));
   line-height: 1.45;
   overflow-wrap: anywhere;
-}
-
-/* 生图失败提示的忽略按钮：点掉即清状态落库，不再提示 */
-.feed-post-photo-error-dismiss {
-  margin-left: 6px;
-  padding: 0 4px;
-  border: none;
-  background: none;
-  color: inherit;
-  opacity: 0.65;
-  font-size: inherit;
-  line-height: 1;
-  cursor: pointer;
-  vertical-align: baseline;
-}
-
-.feed-post-photo-error-dismiss:active {
-  opacity: 1;
 }
 
 /* 文字描述占位块要铺满整行：三层默认都是收缩到内容宽（stack 的 flex-start、
@@ -1664,6 +1678,19 @@
   position: absolute;
   right: 8px;
   bottom: 8px;
+}
+
+/* 生图失败弹窗：一次性提示，关掉就没了，不在气泡下留红字 */
+.chat-generated-image-error-dialog {
+  width: 82%;
+  max-width: 320px;
+}
+
+.chat-generated-image-error-text {
+  color: var(--c-text);
+  font-size: calc(13px*var(--app-text-scale,1));
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .chat-generated-image-prompt-dialog,
@@ -6871,6 +6898,17 @@
   color: var(--c-danger, #e5484d);
 }
 
+/* ── 底层调用日志：「查看原始」按钮 + 思维链 / 真实原始响应 ── */
+.api-log-reasoning {
+  padding: 8px;
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.4;
+  background: rgba(255,149,0,0.12);
+  border-left: 3px solid var(--c-warning);
+}
+
 /* ── 全屏特效设置弹窗（底部全宽弹层）── */
 .screen-fx-sheet {
   background: var(--c-page-body-bg);
@@ -7234,4 +7272,70 @@
   height: 100%;
   object-fit: cover;
   display: block;
+}
+
+/* ── 流式生成预览 ──
+   开启「流式生成」后，线上/线下、单聊/群聊回复在生成过程中实时显示。
+   预览气泡复用普通气泡底色，末尾带闪烁光标提示仍在生成。 */
+.chat-stream-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  opacity: 0.92;
+}
+
+.chat-stream-bubble {
+  position: relative;
+  background: var(--c-bubble-other, #FFFFFF);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+/* 流式预览正文：轻量渲染，避免每帧 markdown/双语解析导致闪烁卡顿。
+   保留换行与基础间距观感，与正式气泡（BilingualTextBlock）视觉接近。 */
+.chat-stream-text {
+  font-size: calc(14px * var(--app-text-scale, 1));
+  line-height: 1.7;
+  color: var(--c-text-title, var(--c-text));
+  overflow-wrap: break-word;
+}
+
+.chat-stream-bubble .chat-stream-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  border-radius: 1px;
+  background: currentColor;
+  animation: chat-stream-cursor-blink 1s steps(2, start) infinite;
+}
+
+@keyframes chat-stream-cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* 线下模式生成中的实时正文预览：比普通文案稍浅，区分「未落库」 */
+.chat-offline-stream-preview {
+  margin-top: 8px;
+  max-height: 40vh;
+  overflow-y: auto;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--c-input, rgba(0, 0, 0, 0.04));
+  color: var(--c-text, inherit);
+  text-align: left;
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.chat-offline-stream-preview .chat-stream-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  border-radius: 1px;
+  background: currentColor;
+  animation: chat-stream-cursor-blink 1s steps(2, start) infinite;
 }

@@ -202,7 +202,15 @@ function rootGuard(scope: string): string {
         "opacity: 1 !important",
         "pointer-events: auto !important",
     ];
-    return `${scope}${scope}{${props.join(";")}}`;
+    // 标题栏同样钉住可见性：藏掉它就藏掉了返回按钮，玩家会被困在对局里。
+    // 只钉"看得见点得到"，配色圆角尺寸随便改。
+    const headerProps = [
+        "display: flex !important",
+        "visibility: visible !important",
+        "opacity: 1 !important",
+        "pointer-events: auto !important",
+    ];
+    return `${scope}${scope}{${props.join(";")}}\n${scope}${scope} .mix-game-header{${headerProps.join(";")}}`;
 }
 
 /**

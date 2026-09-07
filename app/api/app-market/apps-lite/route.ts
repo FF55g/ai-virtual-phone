@@ -6,7 +6,7 @@ import type { CustomAppMarketItem, CustomAppPackageKind, CustomAppReviewStatus }
 import type { CustomAppManifest, CustomAppPermission } from "@/lib/custom-app-types";
 
 const FALLBACK_COLUMNS = "id,app_id,name,version,changelog,description,icon_data_url,permissions,manifest,package_kind,package_size,author_id,author_name,author_avatar,review_status,install_count,like_count,created_at,updated_at";
-const PUBLIC_CACHE_HEADERS = { "Cache-Control": "public, max-age=0, must-revalidate", "Netlify-CDN-Cache-Control": "public, s-maxage=120, stale-while-revalidate=600", "Netlify-Vary": "query" } as const;
+const PUBLIC_CACHE_HEADERS = { "Cache-Control": "public, max-age=0, must-revalidate", "Netlify-CDN-Cache-Control": "public, durable, s-maxage=120, stale-while-revalidate=600", "Netlify-Vary": "query" } as const;
 type MarketListRow = { id?: unknown; app_id?: unknown; name?: unknown; version?: unknown; changelog?: unknown; description?: unknown; icon_data_url?: unknown; has_icon?: unknown; permissions?: unknown; manifest?: unknown; package_kind?: unknown; package_size?: unknown; author_id?: unknown; author_name?: unknown; author_avatar?: unknown; review_status?: unknown; install_count?: unknown; like_count?: unknown; created_at?: unknown; updated_at?: unknown };
 function cleanText(value: unknown, maxLength: number): string { return String(value ?? "").replace(/\u0000/g, "").trim().slice(0, maxLength); }
 function cleanId(value: unknown): string { return cleanText(value, 120).toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, ""); }

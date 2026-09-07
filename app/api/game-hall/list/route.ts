@@ -10,7 +10,7 @@ import {
 const SUMMARY_COLUMNS = "id,title,code_name,subtitle,synopsis,play_note,cover_image,tags,author_id,author_name,author_avatar,source,version,role_slots,allow_external_control,purchase_count,rating,like_count,favorite_count,comment_count,created_at,updated_at";
 const CACHE_HEADERS = {
   "Cache-Control": "public, max-age=0, must-revalidate",
-  "Netlify-CDN-Cache-Control": "public, s-maxage=120, stale-while-revalidate=600",
+  "Netlify-CDN-Cache-Control": "public, durable, s-maxage=120, stale-while-revalidate=600",
 } as const;
 
 function cleanText(value: unknown, maxLength: number): string {

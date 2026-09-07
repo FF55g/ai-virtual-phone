@@ -15,7 +15,9 @@ export type ChatOfflineTurn = {
     summary: string;
     summaryTag: string;
     rawText?: string;
-    reasoning?: string;
+    reasoning?: string; // 模型思维链（reasoning/CoT）内容（本 fork 字段名，对应上游 reasoningText）
+    thinkingText?: string; // 预设格式 <thinking> 标签解析出的思维链（展示优先于 reasoning）
+    thinkingTag?: string; // 实际用于提取思维链的标签名（preset.thinking_tag 或默认 thinking）
     createdAt: string;
 };
 
@@ -33,6 +35,8 @@ export type ParsedOfflineResponse = {
     summary: string;
     summaryTag: string;
     reasoning: string;
+    thinking?: string; // 预设格式 <thinking> 标签内容（与模型 API 原生 reasoning 无关）
+    thinkingTag?: string; // 实际用于提取思维链的标签名
 };
 
 function storageKey(sessionId: string): string {
@@ -68,6 +72,8 @@ function normalizeTurn(value: unknown): ChatOfflineTurn | null {
         summaryTag: typeof item.summaryTag === "string" && item.summaryTag.trim() ? item.summaryTag.trim() : "summary",
         rawText: rawThink ? rawThink.cleaned : rawSource,
         reasoning: reasoning || undefined,
+        thinkingText: typeof item.thinkingText === "string" ? item.thinkingText : undefined,
+        thinkingTag: typeof item.thinkingTag === "string" ? item.thinkingTag : undefined,
         createdAt: item.createdAt,
     };
 }
@@ -106,6 +112,8 @@ export function appendChatOfflineTurn(input: {
     summaryTag: string;
     rawText?: string;
     reasoning?: string;
+    thinkingText?: string;
+    thinkingTag?: string;
 }): ChatOfflineTurn {
     const turn: ChatOfflineTurn = {
         id: createTurnId(),
@@ -116,6 +124,8 @@ export function appendChatOfflineTurn(input: {
         summaryTag: input.summaryTag.trim() || "summary",
         rawText: input.rawText,
         reasoning: input.reasoning,
+        thinkingText: input.thinkingText,
+        thinkingTag: input.thinkingTag,
         createdAt: appNowISO(),
     };
     saveChatOfflineTurns(input.sessionId, [...loadChatOfflineTurns(input.sessionId), turn]);
@@ -125,7 +135,7 @@ export function appendChatOfflineTurn(input: {
 export function updateChatOfflineTurn(
     sessionId: string,
     turnId: string,
-    patch: Partial<Pick<ChatOfflineTurn, "userContent" | "assistantContent" | "summary" | "summaryTag" | "rawText" | "reasoning">>,
+    patch: Partial<Pick<ChatOfflineTurn, "userContent" | "assistantContent" | "summary" | "summaryTag" | "rawText" | "reasoning" | "thinkingText" | "thinkingTag">>,
 ): ChatOfflineTurn | null {
     let updated: ChatOfflineTurn | null = null;
     const turns = loadChatOfflineTurns(sessionId).map((turn) => {
@@ -221,6 +231,14 @@ function stripXmlField(rawText: string, tag: string): string {
     return rawText.replace(new RegExp(`<${escaped}>[\\s\\S]*?</${escaped}>`, "gi"), "").trim();
 }
 
+/** 从原始输出中提取指定标签包裹的思维链（仅当预设开启标签解析时调用）。
+ *  默认标签 thinking 时兼容 thought / think（DeepSeek R1 系模型输出 <think>）。 */
+export function extractThinkingTag(rawText: string, tag?: string): string {
+    const effective = (tag || "thinking").trim() || "thinking";
+    const tags = effective === "thinking" ? ["thinking", "thought", "think"] : [effective];
+    return extractXmlField(rawText.trim(), tags).trim();
+}
+
 export function parseOfflineResponse(rawText: string, summaryTag: string): ParsedOfflineResponse {
     // Pull the chain-of-thought out before any field extraction. `rawText` is
     // replayed verbatim into prompt history (formatOfflineTurnXml) and is the
@@ -230,8 +248,11 @@ export function parseOfflineResponse(rawText: string, summaryTag: string): Parse
     const trimmed = think.cleaned;
     const effectiveSummaryTag = summaryTag.trim() || "summary";
     const summary = extractXmlField(trimmed, [effectiveSummaryTag, "summary"]);
-    const content = extractXmlField(trimmed, ["content"])
-        || stripXmlField(stripXmlField(trimmed, effectiveSummaryTag), "summary");
+    let content = extractXmlField(trimmed, ["content"]);
+    if (!content) {
+        // 无 <content> 标签时回退到剥掉摘要标签后的全文
+        content = stripXmlField(stripXmlField(trimmed, effectiveSummaryTag), "summary");
+    }
     return {
         rawText: trimmed,
         content: content.trim(),
@@ -239,4 +260,33 @@ export function parseOfflineResponse(rawText: string, summaryTag: string): Parse
         summaryTag: effectiveSummaryTag,
         reasoning: think.content,
     };
+}
+
+// ── 聊天列表用：最后一条线下记录 ─────────────────────────────
+// 聊天列表在每次渲染时都会逐会话读取，这里按原始 JSON 串缓存解析结果，
+// 避免把整段线下记录反复 parse。
+const lastTurnCache = new Map<string, { raw: string; turn: ChatOfflineTurn | null }>();
+
+export function getLastChatOfflineTurn(sessionId: string): ChatOfflineTurn | null {
+    let raw = "";
+    try {
+        raw = kvGet(storageKey(sessionId)) || "";
+    } catch {
+        return null;
+    }
+    const cached = lastTurnCache.get(sessionId);
+    if (cached && cached.raw === raw) return cached.turn;
+    const turns = raw ? loadChatOfflineTurns(sessionId) : [];
+    const turn = turns.length ? turns[turns.length - 1] : null;
+    lastTurnCache.set(sessionId, { raw, turn });
+    return turn;
+}
+
+// 线下记录没有普通消息那样的 preview 字段，这里从摘要/正文里压一条出来，
+// 并带上「线下」标记，方便在列表里跟线上消息区分。
+export function getChatOfflineTurnPreview(turn: ChatOfflineTurn | null): string {
+    if (!turn) return "";
+    const source = turn.summary.trim() || turn.assistantContent.trim() || turn.userContent.trim();
+    const text = compactProjectionText(source, 60);
+    return text ? `[线下] ${text}` : "";
 }

@@ -5,6 +5,7 @@ import {
   formatMixologyError,
   getMixologySupabaseConfig,
   mixologyRestFetch,
+  uploadMixologyCoverToStorage,
 } from "@/lib/server/mixology-supabase";
 
 type CoverRow = { cover?: unknown };
@@ -39,7 +40,7 @@ function decodeDataUrl(value: string): { mime: string; bytes: Buffer } | null {
 
 const IMMUTABLE_HEADERS = {
   "Cache-Control": "public, max-age=31536000, immutable",
-  "Netlify-CDN-Cache-Control": "public, s-maxage=31536000, immutable",
+  "Netlify-CDN-Cache-Control": "public, durable, s-maxage=31536000, immutable",
   "Netlify-Vary": "query",
 } as const;
 
@@ -62,6 +63,20 @@ export async function GET(request: Request) {
       return new Response(null, {
         status: 302,
         headers: { ...IMMUTABLE_HEADERS, Location: cover },
+      });
+    }
+
+    // 存量 base64 封面的惰性迁移：第一次被请求时顺手转存到公开桶并回写行，
+    // 之后（含本次）都 302 到桶的公共 URL；转存失败则照旧从函数下发字节。
+    const migratedUrl = await uploadMixologyCoverToStorage(type, id, cover);
+    if (migratedUrl) {
+      await mixologyRestFetch(
+        `${table}?id=eq.${encodeMixologyFilter(id)}&deleted_at=is.null`,
+        { method: "PATCH", body: JSON.stringify({ cover: migratedUrl }) },
+      ).catch(() => null);
+      return new Response(null, {
+        status: 302,
+        headers: { ...IMMUTABLE_HEADERS, Location: migratedUrl },
       });
     }
 

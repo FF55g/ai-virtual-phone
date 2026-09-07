@@ -679,7 +679,14 @@ async function restoreFromCloudManifestInternal(
   manifestName: string,
   options: { overwrite?: boolean; moduleIds?: DataModuleId[]; onProgress?: (p: CloudProgress) => void },
 ): Promise<{ added: number; skipped: number; overwritten: number; errors: string[] }> {
-  const onProgress = options.onProgress ?? (() => {});
+  const rawOnProgress = options.onProgress ?? (() => {});
+  // Remember the last percent so out-of-band events (media downloads inside the
+  // import phase) can refresh the detail text without jumping the bar around.
+  let lastPercent = 1;
+  const onProgress = (p: CloudProgress) => {
+    lastPercent = p.percent;
+    rawOnProgress(p);
+  };
   onProgress({ percent: 1, detail: "读取备份清单…" });
   const manifest = await loadManifest(config, manifestName);
   if (!manifest) throw new Error("找不到该备份清单。");
@@ -691,30 +698,123 @@ async function restoreFromCloudManifestInternal(
   // Pull each media binary on demand, one at a time (low peak memory). Old cloud
   // backups have no media map, so they fall back to media/<ref>.bin.
   const invalidMedia = new Set<string>();
-  const resolver: MediaResolver = async (ref) => {
-    if (invalidMedia.has(ref)) return null;
+  // 成功下载的媒体也要缓存（LRU，按字节封顶）：同一媒体被 N 条记录引用时，
+  // 以前每遇到一次就重新下载 + 重新 sha256 校验一次——大量重复引用（头像、
+  // 表情、主题图）直接把恢复拖成小时级，看起来就是「进度条卡住」。
+  const MEDIA_CACHE_MAX_BYTES = 96 * 1024 * 1024;
+  const mediaCache = new Map<string, Blob>();
+  let mediaCacheBytes = 0;
+  const cacheMedia = (ref: string, blob: Blob) => {
+    if (blob.size > MEDIA_CACHE_MAX_BYTES) return;
+    while (mediaCacheBytes + blob.size > MEDIA_CACHE_MAX_BYTES && mediaCache.size > 0) {
+      const oldest = mediaCache.entries().next().value as [string, Blob];
+      mediaCache.delete(oldest[0]);
+      mediaCacheBytes -= oldest[1].size;
+    }
+    mediaCache.set(ref, blob);
+    mediaCacheBytes += blob.size;
+  };
+  const formatMb = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+
+  // Download one media object (all parts) and verify its content hash.
+  // Returns null when the object is definitively missing or corrupt.
+  const fetchMediaBlob = async (ref: string, onBytes?: (received: number, total: number | null) => void): Promise<Blob | null> => {
     const media = mediaByRef.get(ref);
     const paths = media?.parts && media.parts.length > 0 ? media.parts : [legacyMediaPath(ref)];
     const blobs: Blob[] = [];
+    let receivedBefore = 0;
     for (const path of paths) {
-      const part = await getObject(config, path);
-      if (!part) {
-        invalidMedia.add(ref);
-        return null;
-      }
+      const part = await getObject(config, path, (received, total) => {
+        onBytes?.(receivedBefore + received, media?.bytes ?? (paths.length === 1 ? total : null));
+      });
+      if (!part) return null;
+      receivedBefore += part.size;
       blobs.push(part);
     }
     const combined = new Blob(blobs);
-    if (await sha256BlobHex(combined) !== ref) {
+    if (await sha256BlobHex(combined) !== ref) return null;
+    return combined;
+  };
+
+  let mediaFetched = 0;
+  let mediaTotalCount = 0; // set after module selection below
+  const resolver: MediaResolver = async (ref) => {
+    if (invalidMedia.has(ref)) return null;
+    const cached = mediaCache.get(ref);
+    if (cached) {
+      // refresh LRU position
+      mediaCache.delete(ref);
+      mediaCache.set(ref, cached);
+      return cached;
+    }
+    mediaFetched += 1;
+    const seq = mediaTotalCount > 0 ? `${mediaFetched}/${mediaTotalCount}` : `${mediaFetched}`;
+    onProgress({ percent: lastPercent, detail: `下载媒体文件 ${seq}…` });
+    let lastByteTick = 0;
+    const combined = await fetchMediaBlob(ref, (received, total) => {
+      const now = Date.now();
+      if (now - lastByteTick < 200) return;
+      lastByteTick = now;
+      onProgress({ percent: lastPercent, detail: `下载媒体文件 ${seq} · ${formatMb(received)}${total ? `/${formatMb(total)}` : ""}` });
+    });
+    if (!combined) {
       invalidMedia.add(ref);
       return null;
     }
+    cacheMedia(ref, combined);
     return combined;
+  };
+
+  // 并发预取一个数据源引用的全部媒体（5 路）。串行逐个下载时每个小对象都要
+  // 付一次完整的 HTTPS 往返延迟——几百个表情/头像/小图能把 79MB 的恢复拖到
+  // 几十分钟，带宽根本没跑满（用户实报「这么小怎么这么慢」）。预取只填到缓存
+  // 预算为止，装不下的留给写入阶段按需拉取，避免缓存互相挤掉来回重下。
+  const prefetchUnitMedia = async (
+    refs: string[],
+    progress: (done: number, count: number, doneBytes: number) => void,
+  ): Promise<void> => {
+    const pending = refs.filter((ref) => !mediaCache.has(ref) && !invalidMedia.has(ref));
+    const toFetch: string[] = [];
+    let plannedBytes = 0;
+    for (const ref of pending) {
+      const size = mediaByRef.get(ref)?.bytes ?? 512 * 1024;
+      if (plannedBytes + size > MEDIA_CACHE_MAX_BYTES) break;
+      plannedBytes += size;
+      toFetch.push(ref);
+    }
+    if (toFetch.length === 0) return;
+    let done = 0;
+    let doneBytes = 0;
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(5, toFetch.length) }, async () => {
+      while (cursor < toFetch.length) {
+        const ref = toFetch[cursor];
+        cursor += 1;
+        try {
+          const blob = await fetchMediaBlob(ref);
+          if (!blob) {
+            invalidMedia.add(ref);
+          } else {
+            cacheMedia(ref, blob);
+            doneBytes += blob.size;
+          }
+        } catch {
+          // 网络抖动：不标记失效，写入阶段按需重试并带出具体错误。
+        }
+        done += 1;
+        progress(done, toFetch.length, doneBytes);
+      }
+    });
+    await Promise.all(workers);
   };
 
   // Progress is weighted by module bytes: downloading ≈70% of a module's share,
   // importing the records the remaining ≈30%.
   const selectedModules = manifest.modules.filter((m) => !selected || selected.has(m.id));
+  mediaTotalCount = new Set(selectedModules.flatMap((m) => [
+    ...(m.mediaRefs ?? []),
+    ...((m.sources ?? []).flatMap((s) => s.mediaRefs ?? [])),
+  ])).size;
   const restoreTotalBytes = Math.max(1, selectedModules.reduce((s, m) => s + (m.bytes || 1), 0));
   let restoreDoneBytes = 0;
   const restorePercent = (fraction: number) => 2 + Math.min(97, 97 * (restoreDoneBytes + fraction) / restoreTotalBytes);
@@ -722,8 +822,8 @@ async function restoreFromCloudManifestInternal(
   for (const mod of manifest.modules) {
     if (selected && !selected.has(mod.id)) continue;
     const units = mod.sources && mod.sources.length > 0
-      ? mod.sources.map((source) => ({ label: `${mod.label} · ${source.label}`, bytes: source.bytes || 1, hash: source.hash, parts: source.parts ?? [] }))
-      : [{ label: mod.label, bytes: mod.bytes || 1, hash: mod.hash, parts: mod.parts ?? [] }];
+      ? mod.sources.map((source) => ({ label: `${mod.label} · ${source.label}`, bytes: source.bytes || 1, hash: source.hash, parts: source.parts ?? [], mediaRefs: source.mediaRefs ?? mod.mediaRefs ?? [] }))
+      : [{ label: mod.label, bytes: mod.bytes || 1, hash: mod.hash, parts: mod.parts ?? [], mediaRefs: mod.mediaRefs ?? [] }];
 
     for (const unit of units) {
       const paths = unit.parts;
@@ -735,8 +835,20 @@ async function restoreFromCloudManifestInternal(
       const blobs: Blob[] = [];
       let missing = false;
       for (let i = 0; i < paths.length; i += 1) {
-        onProgress({ percent: restorePercent((i / paths.length) * unit.bytes * 0.7), detail: `下载 ${unit.label} · 分片 ${i + 1}/${paths.length}` });
-        const blob = await getObject(config, paths[i]);
+        const partBase = (i / paths.length) * unit.bytes * 0.7;
+        const partSpan = (unit.bytes * 0.7) / paths.length;
+        onProgress({ percent: restorePercent(partBase), detail: `下载 ${unit.label} · 分片 ${i + 1}/${paths.length}` });
+        let lastByteTick = 0;
+        const blob = await getObject(config, paths[i], (received, totalBytes) => {
+          const now = Date.now();
+          if (now - lastByteTick < 200) return;
+          lastByteTick = now;
+          const fraction = totalBytes ? Math.min(1, received / totalBytes) : 0;
+          onProgress({
+            percent: restorePercent(partBase + partSpan * fraction),
+            detail: `下载 ${unit.label} · 分片 ${i + 1}/${paths.length} · ${formatMb(received)}${totalBytes ? `/${formatMb(totalBytes)}` : ""}`,
+          });
+        });
         if (!blob) { missing = true; break; }
         blobs.push(blob);
       }
@@ -747,6 +859,7 @@ async function restoreFromCloudManifestInternal(
       }
       let payload: ModulePayload;
       try {
+        onProgress({ percent: restorePercent(unit.bytes * 0.7), detail: `解压并校验 ${unit.label}…` });
         const json = await gunzipBlob(new Blob(blobs));
         if (await sha256TextHex(json) !== unit.hash) throw new Error("完整性校验失败");
         const parsed = JSON.parse(json) as unknown;
@@ -757,13 +870,41 @@ async function restoreFromCloudManifestInternal(
         restoreDoneBytes += unit.bytes;
         continue;
       }
+      // 写入之前先把这个数据源引用的媒体并发拉回来（缓存预算内）。
+      if (unit.mediaRefs.length > 0) {
+        await prefetchUnitMedia(unit.mediaRefs, (done, count, doneBytes) => {
+          onProgress({
+            percent: restorePercent(unit.bytes * (0.7 + 0.12 * (done / count))),
+            detail: `下载 ${unit.label} 媒体（${done}/${count} · ${formatMb(doneBytes)}）`,
+          });
+        });
+      }
       for (let sourceIndex = 0; sourceIndex < payload.sources.length; sourceIndex += 1) {
-        onProgress({ percent: restorePercent(unit.bytes * (0.7 + 0.3 * (sourceIndex / payload.sources.length))), detail: `写入 ${unit.label}…` });
-        const result = await importSource(payload.sources[sourceIndex], Boolean(options.overwrite), resolver);
-        total.added += result.added;
-        total.skipped += result.skipped;
-        total.overwritten += result.overwritten;
-        total.errors.push(...result.errors);
+        onProgress({ percent: restorePercent(unit.bytes * (0.82 + 0.18 * (sourceIndex / payload.sources.length))), detail: `写入 ${unit.label}…` });
+        // 写入是恢复里最慢的阶段（逐条 IndexedDB 事务 + 按需拉媒体），云端 v2
+        // 的 payload 恒只有 1 个 source——以前这里整个阶段进度都定在同一个值，
+        // 用户看到的就是「进度条卡住不动」。现在按记录数推进（限流避免刷屏）。
+        let lastTickAt = 0;
+        const importProgress = (done: number, totalRecords: number) => {
+          const now = Date.now();
+          if (done < totalRecords && now - lastTickAt < 150) return;
+          lastTickAt = now;
+          const fraction = totalRecords > 0 ? done / totalRecords : 1;
+          onProgress({
+            percent: restorePercent(unit.bytes * (0.82 + 0.18 * ((sourceIndex + fraction) / payload.sources.length))),
+            detail: `写入 ${unit.label}（${done}/${totalRecords}）…`,
+          });
+        };
+        try {
+          const result = await importSource(payload.sources[sourceIndex], Boolean(options.overwrite), resolver, importProgress);
+          total.added += result.added;
+          total.skipped += result.skipped;
+          total.overwritten += result.overwritten;
+          total.errors.push(...result.errors);
+        } catch (error) {
+          // 一个数据源写崩不该中断整场恢复（否则后面的模块全部丢失）。
+          total.errors.push(`${unit.label}: 写入失败：${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       restoreDoneBytes += unit.bytes;
     }

@@ -6,7 +6,9 @@ import {
     determineBaseUrl,
     isNativeAnthropicApi,
     isNativeGoogleApi,
+    stripHallucinatedTimestamps,
 } from "./api-helpers";
+import { resolveEnabledGenerationParameters } from "./generation-parameters";
 
 export type LlmProviderKind = "openai-compatible" | "anthropic" | "gemini";
 export type NativeToolProtocol = "openai-compatible" | "anthropic" | "gemini";
@@ -37,6 +39,8 @@ export type LlmRequestPayload = {
     body: Record<string, unknown>;
     providerKind: LlmProviderKind;
     messagesForLog: { role: string; content: string | LLMContentPart[]; marker?: string }[];
+    /** 需要经本站 /api/llm-proxy 服务端转发（OpenCode 网关未开放浏览器 CORS 时置 true） */
+    serverProxy?: boolean;
 };
 
 export type LlmParsedResponse = {
@@ -263,13 +267,9 @@ export function buildProviderRequest(
     return buildOpenAICompatibleRequest(config, preset, baseUrl, providerMessages, options);
 }
 
-export function stripHallucinatedTimestamps(text: string): string {
-    // 括号内以完整日期时间开头的一律剥掉：兼容带秒、时区（Europe/Madrid、UTC+2）、
-    // 星期等尾巴与全角括号——prompt 给历史消息标注的时间带时区时，AI 会照格式模仿
-    return text
-        .replace(/[（(]\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?(?:\s+[^)）]*)?[)）]\s*/g, "")
-        .replace(/\(system\s*time\s*[:：][^)]*\)\s*/gi, "");
-}
+// 剥离逻辑收敛到 api-helpers（更底层，微信助手运行时也照抄同一份正则）；
+// 这里保留同名再导出，调用方无需改动。
+export { stripHallucinatedTimestamps };
 
 export function buildProviderDebugMessages(
     config: ApiConfig,
@@ -295,19 +295,19 @@ export function parseProviderStreamDelta(providerKind: LlmProviderKind, data: un
 }
 
 function buildSamplingBody(preset: PresetConfig | null): Record<string, unknown> {
-    const body: Record<string, unknown> = {
-        temperature: preset?.temperature ?? 0.8,
-        top_p: preset?.top_p ?? 1.0,
-        frequency_penalty: preset?.frequency_penalty ?? 0,
-        presence_penalty: preset?.presence_penalty ?? 0,
-    };
-    if (preset?.openai_max_tokens && preset.openai_max_tokens > 0) body.max_tokens = preset.openai_max_tokens;
-    if (preset?.repetition_penalty !== undefined && preset.repetition_penalty !== 1) {
-        body.repetition_penalty = preset.repetition_penalty;
+    const enabled = resolveEnabledGenerationParameters(preset);
+    const body: Record<string, unknown> = {};
+    if (enabled.has("temperature")) body.temperature = preset?.temperature ?? 0.8;
+    if (enabled.has("top_p")) body.top_p = preset?.top_p ?? 1.0;
+    if (enabled.has("frequency_penalty")) body.frequency_penalty = preset?.frequency_penalty ?? 0;
+    if (enabled.has("presence_penalty")) body.presence_penalty = preset?.presence_penalty ?? 0;
+    if (enabled.has("max_tokens") && preset?.openai_max_tokens && preset.openai_max_tokens > 0) {
+        body.max_tokens = preset.openai_max_tokens;
     }
-    if (preset?.top_k && preset.top_k > 0) body.top_k = preset.top_k;
-    if (preset?.min_p && preset.min_p > 0) body.min_p = preset.min_p;
-    if (preset?.top_a && preset.top_a > 0) body.top_a = preset.top_a;
+    if (enabled.has("repetition_penalty")) body.repetition_penalty = preset?.repetition_penalty ?? 1;
+    if (enabled.has("top_k")) body.top_k = preset?.top_k ?? 0;
+    if (enabled.has("min_p")) body.min_p = preset?.min_p ?? 0;
+    if (enabled.has("top_a")) body.top_a = preset?.top_a ?? 0;
     return body;
 }
 
@@ -522,7 +522,13 @@ function buildOpenAICompatibleRequest(
         }),
         ...buildSamplingBody(preset),
     };
-    if (options.maxTokens && options.maxTokens > 0) body.max_tokens = Math.floor(options.maxTokens);
+    if (
+        options.maxTokens
+        && options.maxTokens > 0
+        && (!preset?.enabled_generation_parameters || resolveEnabledGenerationParameters(preset).has("max_tokens"))
+    ) {
+        body.max_tokens = Math.floor(options.maxTokens);
+    }
     if (options.stream) body.stream = true;
     if (options.tools?.length) {
         body.tools = options.tools.map((tool) => ({
@@ -562,16 +568,19 @@ function buildAnthropicRequest(
 ): LlmRequestPayload {
     const { systemText: system, rest } = splitLeadingSystemMessages(messages);
     const bodyMessages = compactAnthropicMessages(rest);
+    const enabled = resolveEnabledGenerationParameters(preset);
     const body: Record<string, unknown> = {
         model: config.defaultModel,
         messages: bodyMessages,
-        temperature: preset?.temperature ?? 0.8,
         max_tokens: options.maxTokens && options.maxTokens > 0
             ? Math.floor(options.maxTokens)
-            : preset?.openai_max_tokens && preset.openai_max_tokens > 0 ? preset.openai_max_tokens : ANTHROPIC_AUTO_MAX_TOKENS,
+            : enabled.has("max_tokens") && preset?.openai_max_tokens && preset.openai_max_tokens > 0
+                ? preset.openai_max_tokens
+                : ANTHROPIC_AUTO_MAX_TOKENS,
     };
-    if (preset?.top_p !== undefined) body.top_p = preset.top_p;
-    if (preset?.top_k && preset.top_k > 0) body.top_k = preset.top_k;
+    if (enabled.has("temperature")) body.temperature = preset?.temperature ?? 0.8;
+    if (preset && enabled.has("top_p")) body.top_p = preset.top_p ?? 1;
+    if (enabled.has("top_k")) body.top_k = preset?.top_k ?? 0;
     if (system) body.system = system;
     if (options.stream) body.stream = true;
     if (options.tools?.length) {
@@ -630,16 +639,22 @@ function buildGeminiRequest(
     const { systemText, rest } = splitLeadingSystemMessages(messages);
     const headers = buildRequestHeaders(config, baseUrl);
     delete headers.Authorization;
+    const enabled = resolveEnabledGenerationParameters(preset);
+    const generationConfig: Record<string, unknown> = {};
+    if (enabled.has("temperature")) generationConfig.temperature = preset?.temperature ?? 0.8;
+    if (enabled.has("top_p")) generationConfig.topP = preset?.top_p ?? 1;
+    if (enabled.has("top_k")) generationConfig.topK = preset?.top_k ?? 0;
+    if (
+        options.maxTokens
+        && options.maxTokens > 0
+        && (!preset?.enabled_generation_parameters || enabled.has("max_tokens"))
+    ) {
+        generationConfig.maxOutputTokens = Math.floor(options.maxTokens);
+    } else if (enabled.has("max_tokens") && preset?.openai_max_tokens && preset.openai_max_tokens > 0) {
+        generationConfig.maxOutputTokens = preset.openai_max_tokens;
+    }
     const body: Record<string, unknown> = {
         contents: compactGeminiContents(rest),
-        generationConfig: {
-            temperature: preset?.temperature ?? 0.8,
-            topP: preset?.top_p ?? 1,
-            ...(preset?.top_k && preset.top_k > 0 ? { topK: preset.top_k } : {}),
-            ...(options.maxTokens && options.maxTokens > 0
-                ? { maxOutputTokens: Math.floor(options.maxTokens) }
-                : preset?.openai_max_tokens && preset.openai_max_tokens > 0 ? { maxOutputTokens: preset.openai_max_tokens } : {}),
-        },
         safetySettings: [
             { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
             { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
@@ -647,6 +662,7 @@ function buildGeminiRequest(
             { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
         ],
     };
+    if (Object.keys(generationConfig).length > 0) body.generationConfig = generationConfig;
     if (systemText) body.systemInstruction = { parts: [{ text: systemText }] };
     if (options.tools?.length) {
         body.tools = [{

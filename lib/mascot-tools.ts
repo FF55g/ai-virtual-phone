@@ -15,7 +15,7 @@ import { appNowISO } from "./app-clock";
 import type { ToolCall, ToolResult } from "./tool-executor";
 import type { MascotPageContext } from "./mascot-context";
 import type { Prompt } from "./settings-types";
-import { CHARACTER_CARD_PROMPT, CHARACTER_WORLD_PROMPT, WORLDBOOK_PROMPT, PRESET_PROMPT, GENERAL_PRESET_PROMPT, REGEX_PROMPT, CSS_PROMPT, WIDGET_PROMPT } from "./mascot-prompts";
+import { CHARACTER_CARD_PROMPT, CHARACTER_WORLD_PROMPT, WORLDBOOK_PROMPT, PRESET_PROMPT, GENERAL_PRESET_PROMPT, REGEX_PROMPT, CSS_PROMPT, WIDGET_PROMPT, MIXOLOGY_PROMPT } from "./mascot-prompts";
 import {
     buildCssAssetNineSliceCss,
     calibrateCssAssetNineSlice,
@@ -763,6 +763,157 @@ const STATUS_BAR_PROMPT = `线上聊天状态栏 = 让 AI 每轮在 [状态栏].
 · **启用后原生的好感度/占有欲/焦虑值会停止更新**（状态区整块被契约取代了）。
 · 如果该会话之前用正则渲染过状态栏，两套会互相竞争，让用户二选一。`;
 
+
+// ── 独家特调工具 ──
+const MIX_KIND_ENUM = ["character", "persona", "preface", "base", "flavor", "glass", "strength", "ticket", "garnish", "encore", "checklist", "filter", "mechanism"];
+
+const MIX_LIST_CABINET_SCHEMA = {
+    type: "object",
+    properties: {
+        kind: { type: "string", enum: MIX_KIND_ENUM, description: "可选：只列这一类材料。不传列全部（含配方清单）。" },
+    },
+};
+
+const MIX_READ_MATERIAL_SCHEMA = {
+    type: "object",
+    properties: {
+        id: { type: "string", description: "材料 id（优先用，列出酒柜可查）" },
+        name: { type: "string", description: "材料名（无 id 时用；重名会返回候选列表）" },
+    },
+};
+
+const MIX_READ_CRAFT_SPEC_SCHEMA = {
+    type: "object",
+    properties: {
+        kind: { type: "string", enum: MIX_KIND_ENUM, description: "要读哪一类材料的制作规格" },
+    },
+    required: ["kind"],
+};
+
+/** 创建/更新共用的字段说明（按 kind 取用，执行器会校验字段归属） */
+const MIX_MATERIAL_FIELDS = {
+    hook: { type: "string", description: "一句话介绍（列表卡片上的钩子文案）" },
+    cover: { type: "string", description: "封面图地址，仅角色卡接受：http(s) URL（用户发图时可经图像处理套件「导入用户图片为素材→上传图床」取得）或 data:image/ dataURL；其余种类的列表封面由渲染效果自动生成，传了会被拒" },
+    tags: { type: "array", items: { type: "string" }, description: "标签数组，最多 8 个短词" },
+    charName: { type: "string", description: "character：角色名，不传默认与 name 相同" },
+    content: { type: "string", description: "persona/base/flavor/glass/strength：正文" },
+    userName: { type: "string", description: "persona：你的名字" },
+    baseInfo: { type: "string", description: "character：基础信息" },
+    personality: { type: "string", description: "character：性格" },
+    appearance: { type: "string", description: "character：外貌" },
+    background: { type: "string", description: "character：背景" },
+    worldview: { type: "string", description: "character：世界观" },
+    cognition: { type: "string", description: "character：对{{user}}的初始认知" },
+    relations: { type: "string", description: "character：关系与身份" },
+    plot: { type: "string", description: "character：当前剧情" },
+    extra: { type: "string", description: "character：附加设定" },
+    openings: { type: "array", items: { type: "string" }, description: "character：开场白数组，每个元素一条完整开场白，至少一条" },
+    examples: {
+        type: "array",
+        items: { type: "object", properties: { role: { type: "string", enum: ["user", "char"] }, text: { type: "string" } }, required: ["role", "text"] },
+        description: "character：示例对话",
+    },
+    canvas: { type: "string", description: "character：开场画布完整 HTML（规格见 读取制作说明）" },
+    contract: { type: "string", description: "ticket/encore：输出契约" },
+    renderHtml: { type: "string", description: "ticket/encore：渲染代码完整 HTML" },
+    previewRaw: { type: "string", description: "ticket/encore：预览示例数据（壳内原文，不带 [状态栏]/[小剧场] 标记）" },
+    historyFeed: { type: "string", enum: ["latest", "all", "none"], description: "ticket/encore 选填：往期轮次的壳内原文要不要回传给模型。latest（默认）只回传最近一轮，token 不随轮数涨；all 全部回传，契约需要引用往期内容时才用；none 完全不回传，纯展示、最省 token" },
+    vars: {
+        type: "array",
+        items: { type: "object", properties: { name: { type: "string" }, initial: { type: "string" } }, required: ["name"] },
+        description: "ticket：要跨轮记住的变量",
+    },
+    css: { type: "string", description: "garnish：完整 CSS" },
+    rules: {
+        type: "array",
+        items: { type: "object", properties: { find: { type: "string" }, replace: { type: "string" }, mode: { type: "string", enum: ["display", "context"] } }, required: ["find", "mode"] },
+        description: "filter：清洗规则数组",
+    },
+    script: { type: "string", description: "mechanism：钩子逻辑纯 JS" },
+    layout: {
+        type: "object",
+        description: "mechanism 选填：摆放对象。slot 挂点：float（默认自由悬浮）/header/inputbar-left/inputbar-right（宿主画图标按钮点击开合面板，配 icon 一两个 emoji）/flow-top/flow-bottom（作为内嵌卡进滚动流）/hidden（不画面板，只在后台跑）；x/y/w/h 为占画面的百分比，autoHeight 高度随内容",
+    },
+    panelHtml: { type: "string", description: "mechanism：常驻界面完整 HTML（信任模式下不用）" },
+    trusted: { type: "boolean", description: "mechanism 选填：true = 信任模式，script 直接在对局页面里执行（不进沙盒），用 mix.slot(坑位, (el, ctx)=>…) 拿裸 DOM 画进正文（坑位 turn/prose/float/bottom）、mix.on(时机, fn) 登记钩子；能自己 fetch。用户装入时会看到风险提示。只在用户明确要\"自由渲染进正文\"或需要联网时用，其余一律沙盒" },
+    dialogueButton: { type: "object", properties: { icon: { type: "string" }, title: { type: "string" } }, description: "mechanism 选填：对白按钮 {icon, title}。icon 用内置名字 speaker/play/translate/note/bookmark/star/heart/quote/spark（画成特调同色系线性图标）。宿主在对局每句「对白」后画这颗图标，点击把这句递进界面 window.onMixDialogue({id, text, turnId})，界面可 mix.mark(id, 状态) 改图标、mix.play(id, 音频) 让宿主放、mix.toast(text) 提示。做「点一句念一句」这类玩法用它，需要有 panelHtml；不想画面板就 layout.slot 写 hidden" },
+    connectors: { type: "array", items: { type: "string" }, description: "mechanism 选填：界面要用的连接器名字，如 [\"tts\"]。只有声明过的名字 mix.call 才放行；连接器本身用 创建连接器 建，用户到酒柜「连接器」里填密钥" },
+};
+
+const MIX_LIST_CONNECTORS_SCHEMA = { type: "object", properties: {} };
+
+const MIX_SAVE_CONNECTOR_SCHEMA = {
+    type: "object",
+    properties: {
+        name: { type: "string", description: "连接器名字，机括按它找（小写字母/数字/-/_，如 tts）。用预设时可不传，默认取预设的名字" },
+        preset: { type: "string", enum: ["minimax-cn", "minimax-global"], description: "一键预设：minimax-cn = MiniMax 语音国内版，minimax-global = 海外版。传了预设则 url/headers/body/response 自动填好，密钥留占位由用户自己填" },
+        url: { type: "string", description: "接口地址，可含 {{参数名}} 占位；用预设可不传" },
+        method: { type: "string", enum: ["POST", "GET"], description: "默认 POST" },
+        headers: { type: "object", description: "请求头对象。密钥写占位「你的密钥」，不要向用户索要真实密钥，让用户到酒柜「连接器」里自己填" },
+        body: { type: "string", description: "POST 请求体模板：{{参数名}} 会换成机括 mix.call 传的参数，可写 {{参数名|默认值}}；模板是 JSON 时替进去的字符串自动转义" },
+        response: { type: "string", enum: ["json", "text", "blob"], description: "响应交给机括的形式：json 解析成对象（默认）/ text 字符串 / blob 二进制转 data: URL（音频、图片）" },
+        note: { type: "string", description: "给用户看的一句说明" },
+        overwrite: { type: "boolean", description: "同名连接器已存在时是否覆盖，默认不覆盖" },
+    },
+};
+
+const MIX_DELETE_CONNECTOR_SCHEMA = {
+    type: "object",
+    properties: { name: { type: "string", description: "要删除的连接器名字" } },
+    required: ["name"],
+};
+
+const MIX_CREATE_MATERIAL_SCHEMA = {
+    type: "object",
+    properties: {
+        kind: { type: "string", enum: MIX_KIND_ENUM, description: "材料种类" },
+        name: { type: "string", description: "材料名（character 时同时作为角色名）" },
+        ...MIX_MATERIAL_FIELDS,
+    },
+    required: ["kind", "name"],
+};
+
+const MIX_UPDATE_MATERIAL_SCHEMA = {
+    type: "object",
+    properties: {
+        id: { type: "string", description: "要更新的材料 id（读取材料/列出酒柜可查）" },
+        name: { type: "string", description: "可选：新材料名" },
+        ...MIX_MATERIAL_FIELDS,
+    },
+    required: ["id"],
+};
+
+const MIX_SAVE_RECIPE_SCHEMA = {
+    type: "object",
+    properties: {
+        name: { type: "string", description: "这杯特调的名字；与已有自建配方同名则覆盖更新" },
+        slots: {
+            type: "array",
+            description: "槽位清单。角色卡必有；character/persona 每类 1 件，其余每类最多 3 件。",
+            items: {
+                type: "object",
+                properties: {
+                    kind: { type: "string", enum: MIX_KIND_ENUM },
+                    material: { type: "string", description: "材料名或 id" },
+                    when: {
+                        type: "object",
+                        description: "可选生效条件（character/persona 不可设）：{type:'turn',after:N} / {type:'var',name,op,value} / {type:'keyword',words:[…],within?} / {type:'chance',percent:N}",
+                        properties: {
+                            type: { type: "string", enum: ["turn", "var", "keyword", "chance"] },
+                            after: { type: "number" }, name: { type: "string" }, op: { type: "string" },
+                            value: { type: "string" }, words: { type: "array", items: { type: "string" } },
+                            within: { type: "number" }, percent: { type: "number" },
+                        },
+                        required: ["type"],
+                    },
+                },
+                required: ["kind", "material"],
+            },
+        },
+    },
+    required: ["name", "slots"],
+};
+
 export const MASCOT_TOOL_PACKAGES: MascotToolPackage[] = [
     {
         id: "css_pack",
@@ -889,6 +1040,23 @@ export const MASCOT_TOOL_PACKAGES: MascotToolPackage[] = [
         ],
         usageGuide: WIDGET_PROMPT,
     },
+    {
+        id: "mixology_pack",
+        label: "独家特调套件",
+        description: "管理「独家特调」App（调酒式角色扮演）的酒柜材料与配方：12 类材料（角色卡/面具/序言/基底/风味/杯型/苦精/小票/外观/尾调/滤网/机括）的创建修改、配方调制，以及机括调外部接口用的连接器。与聊天系统的角色卡完全无关。写代码类材料前必须先 读取制作说明。",
+        subTools: [
+            { name: "列出酒柜", description: "列出酒柜材料与官方出厂件（含 id/种类/来源），不传 kind 时附配方清单。", parameterSchema: MIX_LIST_CABINET_SCHEMA },
+            { name: "读取材料", description: "按 id 或名字读取一件材料的完整字段。导入的他人角色卡正文封存，只回元信息。", parameterSchema: MIX_READ_MATERIAL_SCHEMA },
+            { name: "读取制作说明", description: "获取某类材料的完整制作规格（机制约束 + 质量要求 + 字段对照）。新建小票/尾调/机括/带画布的角色卡之前必读。", parameterSchema: MIX_READ_CRAFT_SPEC_SCHEMA },
+            { name: "创建材料", description: "新建一件材料入柜。字段按 kind 取用（见各字段说明），执行器会按类校验并给出精确报错。", parameterSchema: MIX_CREATE_MATERIAL_SCHEMA },
+            { name: "更新材料", description: "增量修改一件自建材料（只传要改的字段）。官方件与导入件不可改。", parameterSchema: MIX_UPDATE_MATERIAL_SCHEMA },
+            { name: "保存配方", description: "把酒柜/官方材料按槽位配成一杯特调（可设生效条件），用户在吧台即可选它开局。", parameterSchema: MIX_SAVE_RECIPE_SCHEMA },
+            { name: "列出连接器", description: "列出用户本机的连接器（机括 mix.call 用的外部接口：名字/地址/密钥是否已填）与可用预设。密钥值不会返回。", parameterSchema: MIX_LIST_CONNECTORS_SCHEMA },
+            { name: "创建连接器", description: "替用户建一个连接器：传 preset 一键生成（如 MiniMax 语音），或自己给 url/headers/body。密钥留占位，由用户到酒柜「连接器」里填。", parameterSchema: MIX_SAVE_CONNECTOR_SCHEMA },
+            { name: "删除连接器", description: "按名字删除一个连接器。", parameterSchema: MIX_DELETE_CONNECTOR_SCHEMA },
+        ],
+        usageGuide: MIXOLOGY_PROMPT,
+    },
 ];
 
 // 导航是独立工具（不在套件里），直接暴露
@@ -1006,6 +1174,15 @@ const MASCOT_NATIVE_TOOL_NAMES: Record<string, string> = {
     "列出读取素材": "mascot_read_css_asset",
     "上传图床": "mascot_upload_css_asset",
     "校准九宫格": "mascot_calibrate_nine_slice",
+    "列出酒柜": "mascot_mix_list_cabinet",
+    "读取材料": "mascot_mix_read_material",
+    "读取制作说明": "mascot_mix_read_craft_spec",
+    "创建材料": "mascot_mix_create_material",
+    "更新材料": "mascot_mix_update_material",
+    "保存配方": "mascot_mix_save_recipe",
+    "列出连接器": "mascot_mix_list_connectors",
+    "创建连接器": "mascot_mix_save_connector",
+    "删除连接器": "mascot_mix_delete_connector",
     "生成九宫格CSS": "mascot_build_nine_slice_css",
     "读取角色": "mascot_read_character",
     "创建角色": "mascot_create_character",
@@ -1056,6 +1233,7 @@ const MASCOT_NATIVE_LOADER_NAMES: Record<string, string> = {
     regex_pack: "mascot_load_regex_pack",
     status_bar_pack: "mascot_load_status_bar_pack",
     widget_pack: "mascot_load_widget_pack",
+    mixology_pack: "mascot_load_mixology_pack",
 };
 
 export function getMascotNativeToolName(displayName: string): string {
@@ -1207,6 +1385,23 @@ export async function executeMascotToolCall(call: ToolCall, ctx: MascotToolConte
             case "预览DIY组件": return await handlePreviewDiyWidget(call.args);
             case "摆放组件": return await handlePlaceWidget(call.args);
             case "移除DIY组件": return await handleRemoveDiyWidget(call.args);
+
+            // ─── 独家特调 ───
+            case "列出酒柜": case "读取材料": case "读取制作说明": case "创建材料": case "更新材料": case "保存配方":
+            case "列出连接器": case "创建连接器": case "删除连接器": {
+                const mix = await import("./mixology/mascot-tools");
+                switch (call.name) {
+                    case "列出酒柜": return mix.mixToolListCabinet(call.args);
+                    case "读取材料": return mix.mixToolReadMaterial(call.args);
+                    case "读取制作说明": return mix.mixToolReadCraftSpec(call.args);
+                    case "创建材料": return mix.mixToolCreateMaterial(call.args);
+                    case "更新材料": return mix.mixToolUpdateMaterial(call.args);
+                    case "列出连接器": return mix.mixToolListConnectors();
+                    case "创建连接器": return mix.mixToolSaveConnector(call.args);
+                    case "删除连接器": return mix.mixToolDeleteConnector(call.args);
+                    default: return mix.mixToolSaveRecipe(call.args);
+                }
+            }
 
             // ─── 导航 ───
             case "导航": return await handleNavigate(call.args);
